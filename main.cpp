@@ -11,7 +11,7 @@
 */
 int main(int argc, char* argv[]) {
     try {
-        auto opened_ports = syn_scan("192.168.52.114", "192.168.58.33", 8000, 10000, 1000);
+        auto opened_ports = syn_scan("192.168.52.114", "192.168.58.33", 8000, 10000, 3000);
 
         for (int i : opened_ports) {
             std::cout << i << " ";

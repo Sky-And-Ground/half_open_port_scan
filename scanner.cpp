@@ -134,6 +134,8 @@ namespace {
             }
 
             struct tcphdr* tcph = (struct tcphdr*)(buffer + 4 * iph->ihl);
+
+            // get the dst port and src port from the tcp packet.
             int dst_port = ntohs(tcph->source);
 
             auto iter = sent_ports.find(dst_port);
@@ -152,7 +154,7 @@ namespace {
                 sent_ports.erase(iter);
             }
 
-            if (tcph->rst) {
+            if (tcph->rst) {   // then this is not opened.
                 sent_ports.erase(iter);
             }
         }

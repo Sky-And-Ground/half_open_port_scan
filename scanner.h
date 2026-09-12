@@ -3,22 +3,8 @@
 
 #include "socket_raii.h"
 #include "epoll_raii.h"
-#include <random>
 #include <system_error>
 #include <vector>
-
-class RandomIntegerGenerator {
-public:
-    RandomIntegerGenerator() = default;
-
-    int operator()() {
-        return dist(gen);
-    }
-private:
-    std::random_device rd;
-    std::mt19937 gen{ rd() };
-    std::uniform_int_distribution<int> dist{ 0, 65535 };
-};
 
 class Scanner {
 public:
@@ -28,7 +14,6 @@ public:
 private:
     Socket sock;
     Epoll epoll;
-    RandomIntegerGenerator randgen;
 };
 
 #endif
