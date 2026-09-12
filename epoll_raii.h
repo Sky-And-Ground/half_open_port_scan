@@ -40,9 +40,7 @@ public:
     }
 
     ~Epoll() {
-        if (fd >= 0) {
-            close(fd);
-        }
+        close();
     }
 
     void close() noexcept {
