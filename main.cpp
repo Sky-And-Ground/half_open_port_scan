@@ -3,9 +3,6 @@
 #include "syn_scan.h"
 
 /*
-    compile with:
-        g++ main.cpp syn_scan.cpp -std=c++11
-    
     running this program should be with root. because this program uses the raw socket, so may be we have to set the firewall:
         iptables -I OUTPUT -s 192.168.52.114 -d 192.168.58.33 -j ACCEPT
 */
