@@ -1,4 +1,7 @@
 #include "scanner.h"
+#include <chrono>
+#include <unordered_set>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -6,6 +9,9 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <fcntl.h>
+
+using namespace std::chrono;
 
 namespace {
     struct PseudoHeader {
@@ -102,7 +108,7 @@ namespace {
         return sendto(sock, packet, sizeof(struct iphdr) + sizeof(struct tcphdr), 0, (struct sockaddr*)&dst_in, sizeof(dst_in)) >= 0;
     }
 
-    bool recv_response(int sock, const char* src_ip, const char* dst_ip, int src_port, int dst_port, int id) {
+    void recv_response(int sock, const char* src_ip, const char* dst_ip, std::vector<int>& opened_ports, std::unordered_set<int> sent_ports) {
         char buffer[4096];
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
@@ -114,7 +120,7 @@ namespace {
             int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&from, &from_len);
 
             if (len < 0) {  // timeout or something error would break this loop.
-                return false;
+                return;
             }
 
             struct iphdr* iph = (struct iphdr*)buffer;
@@ -123,65 +129,120 @@ namespace {
                 continue;
             }
 
-            struct tcphdr* tcph = (struct tcphdr*)(buffer + 4 * iph->ihl);
-
-            if (ntohs(tcph->source) != dst_port) {
-                continue;
-            }
-
             if (from.sin_addr.s_addr != dst_addr.s_addr) {
                 continue;
             }
+
+            struct tcphdr* tcph = (struct tcphdr*)(buffer + 4 * iph->ihl);
+            int dst_port = ntohs(tcph->source);
+
+            auto iter = sent_ports.find(dst_port);
+            if (iter == sent_ports.cend()) {
+                continue;
+            }
+
+            int src_port = ntohs(tcph->dest);
 
             if (tcph->syn && tcph->ack) {
                 uint32_t rseq = ntohl(tcph->ack_seq);
                 uint32_t rack_seq = ntohl(tcph->seq) + 1;
 
-                send_tcp_packet(sock, src_ip, dst_ip, src_port, dst_port, id, rseq, rack_seq, false, true, true);
-                return true;
+                send_tcp_packet(sock, src_ip, dst_ip, src_port, dst_port, iph->id, rseq, rack_seq, false, true, true);
+                opened_ports.emplace_back(dst_port);
+                sent_ports.erase(iter);
             }
 
             if (tcph->rst) {
-                return false;
+                sent_ports.erase(iter);
             }
         }
     }
 }
 
-Scanner::Scanner(int timeout_ms) 
-    : sock { AF_INET, SOCK_RAW, IPPROTO_TCP }
+Scanner::Scanner() 
+    : sock { AF_INET, SOCK_RAW, IPPROTO_TCP }, epoll{ 0 }
 {
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    if (setsockopt(sock.handle(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        std::error_code ec{ errno, std::system_category() };
-        throw std::system_error{ ec, "sys call setsockopt() failed on SO_RCVTIMEO" };
-    }
-
     int flag = 1;
     if (setsockopt(sock.handle(), IPPROTO_IP, IP_HDRINCL, &flag, sizeof(flag)) < 0) {
         std::error_code ec{ errno, std::system_category() };
         throw std::system_error{ ec, "sys call setsockopt() failed on IP_HDRINCL" };
     }
-}
 
-std::vector<int> Scanner::scan(const char* src_ip, const char* dst_ip, const std::vector<int>& port_list) {
-    std::vector<int> opened_ports;
-
-    for (int dst_port : port_list) {
-        int id = randgen();
-        int src_port = 30000 + randgen() % 30000;   // every scan just uses a random port.
-        
-        if (!send_tcp_packet(sock.handle(), src_ip, dst_ip, src_port, dst_port, id, id, 0, true, false, false)) {
-            continue;
-        }
-
-        if (recv_response(sock.handle(), src_ip, dst_ip, src_port, dst_port, id)) {
-            opened_ports.emplace_back(dst_port);
-        }
+    // let sock become non blocking, to deal with the epoll ET mode.
+    flag = fcntl(sock.handle(), F_GETFL, 0);
+    if (flag < 0) {
+        std::error_code ec{ errno, std::system_category() };
+        throw std::system_error{ ec, "sys call fcntl() failed on F_GETFL" };
     }
 
+    if (fcntl(sock.handle(), F_SETFL, flag | O_NONBLOCK) < 0) {
+        std::error_code ec{ errno, std::system_category() };
+        throw std::system_error{ ec, "sys call fcntl() failed on F_SETFL and O_NONBLOCK" };
+    }
+
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = sock.handle();
+
+    if (epoll_ctl(epoll.handle(), EPOLL_CTL_ADD, sock.handle(), &ev) < 0) {
+        std::error_code ec{ errno, std::system_category() };
+        throw std::system_error{ ec, "sys call epoll_ctl failed on EPOLL_CTL_ADD with socket fd" };
+    }
+}
+
+std::vector<int> Scanner::scan(const char* src_ip, const char* dst_ip, const std::vector<int>& port_list, int timeout_ms) {
+    constexpr size_t batch_size = 1024;
+    std::vector<int> opened_ports;
+
+    for (size_t i = 0; i < port_list.size(); i += batch_size) {
+        std::unordered_set<int> sent_ports;
+        int start_id = 30000;
+        int j;
+
+        for (j = 0; (i + j) < port_list.size(); ++j) {
+            int id = start_id + j;
+            int src_port = id;
+            int dst_port = port_list[i + j];
+
+            if (send_tcp_packet(sock.handle(), src_ip, dst_ip, src_port, dst_port, id, id, 0, true, false, false)) {
+                sent_ports.emplace(dst_port);
+            }
+        }
+
+        auto deadline = steady_clock::now() + milliseconds(timeout_ms);
+        struct epoll_event events[batch_size];
+
+        while (!sent_ports.empty()) {
+            auto now = steady_clock::now();
+            
+            if (now > deadline) {
+                break;
+            }
+
+            auto wait_ms = duration_cast<milliseconds>(deadline - now).count();
+            int n = epoll_wait(epoll.handle(), events, batch_size, (int)wait_ms);
+
+            if (n < 0) {
+                std::error_code ec{ errno, std::system_category() };
+                throw std::system_error{ ec, "sys call epoll_wait failed" };
+            }
+            else if (n == 0) {   // time out.
+                break;
+            }
+
+            for (int i = 0; i < n; ++i) {
+                if ((events[i].events & EPOLLIN)) {
+                    recv_response(sock.handle(), src_ip, dst_ip, opened_ports, sent_ports);
+                }
+            }
+        }
+
+        sent_ports.clear();
+    }
+
+    std::sort(opened_ports.begin(), opened_ports.end());
+    opened_ports.erase(std::unique(opened_ports.begin(), opened_ports.end()), opened_ports.end());
     return opened_ports;
 }

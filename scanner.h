@@ -22,9 +22,9 @@ private:
 
 class Scanner {
 public:
-    Scanner(int timeout_ms);
+    Scanner();
 
-    std::vector<int> scan(const char* src_ip, const char* dst_ip, const std::vector<int>& port_list);
+    std::vector<int> scan(const char* src_ip, const char* dst_ip, const std::vector<int>& port_list, int timeout_ms);
 private:
     Socket sock;
     Epoll epoll;

@@ -9,6 +9,6 @@ std::vector<int> syn_scan(const char* src_ip, const char* dst_ip, int port_begin
         port_list.emplace_back(i);
     }
 
-    Scanner scanner{ timeout_ms };
-    return scanner.scan(src_ip, dst_ip, port_list);
+    Scanner scanner;
+    return scanner.scan(src_ip, dst_ip, port_list, timeout_ms);
 }
