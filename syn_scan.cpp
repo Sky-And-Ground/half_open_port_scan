@@ -2,6 +2,7 @@
 #include "socket_raii.h"
 #include <random>
 #include <system_error>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -56,56 +57,7 @@ namespace {
         tcph->check = checksum((uint16_t*)tmp, sizeof(tmp));
     }
 
-    bool send_syn_packet(int sock, const char* src_ip, const char* dst_ip, int src_port, int dst_port, int id) {
-        char packet[4096];
-        memset(packet, 0, sizeof(packet));
-
-        struct iphdr* iph = (struct iphdr*)packet;
-        struct tcphdr* tcph = (struct tcphdr*)(packet + sizeof(struct iphdr));
-
-        struct in_addr src_addr, dst_addr;
-        inet_pton(AF_INET, src_ip, &src_addr);
-        inet_pton(AF_INET, dst_ip, &dst_addr);
-
-        // ip header.
-        iph->ihl      = 5;
-        iph->version  = 4;   // ipv4.
-        iph->tos      = 0;
-        iph->tot_len  = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
-        iph->id       = id;
-        iph->frag_off = 0;
-        iph->ttl      = 64;
-        iph->protocol = IPPROTO_TCP;
-        iph->saddr    = src_addr.s_addr;
-        iph->daddr    = dst_addr.s_addr;
-        iph->check    = checksum((uint16_t*)iph, sizeof(struct iphdr));
-
-        // tcp header.
-        tcph->source  = htons(src_port);
-        tcph->dest    = htons(dst_port);
-        tcph->seq     = id;
-        tcph->ack_seq = 0;
-        tcph->doff    = 5;
-        tcph->fin     = 0;
-        tcph->syn     = 1;
-        tcph->rst     = 0;
-        tcph->psh     = 0;
-        tcph->ack     = 0;
-        tcph->urg     = 0;
-        tcph->window  = htons(65535);
-        tcph->urg_ptr = 0;
-
-        fill_tcphdr_checksum(tcph, src_ip, dst_ip);
-
-        // now we can send it.
-        struct sockaddr_in dst_in;
-        dst_in.sin_family = AF_INET;
-        dst_in.sin_addr = dst_addr;
-
-        return sendto(sock, packet, sizeof(struct iphdr) + sizeof(struct tcphdr), 0, (struct sockaddr*)&dst_in, sizeof(dst_in)) >= 0;
-    }
-
-    bool send_rst_packet(int sock, const char* src_ip, const char* dst_ip, int src_port, int dst_port, int id, int seq, int ack_seq) {
+    bool send_tcp_packet(int sock, const char* src_ip, const char* dst_ip, int src_port, int dst_port, int id, int seq, int ack_seq, bool syn, bool rst, bool ack) {
         char packet[4096];
         memset(packet, 0, sizeof(packet));
 
@@ -136,16 +88,17 @@ namespace {
         tcph->ack_seq = htonl(ack_seq);
         tcph->doff    = 5;
         tcph->fin     = 0;
-        tcph->syn     = 0;
-        tcph->rst     = 1;
+        tcph->syn     = syn ? 1 : 0;
+        tcph->rst     = rst ? 1 : 0;
         tcph->psh     = 0;
-        tcph->ack     = 1;
+        tcph->ack     = rst ? 1 : 0;
         tcph->urg     = 0;
         tcph->window  = htons(65535);
         tcph->urg_ptr = 0;
 
         fill_tcphdr_checksum(tcph, src_ip, dst_ip);
 
+        // now we can send it.
         struct sockaddr_in dst_in;
         dst_in.sin_family = AF_INET;
         dst_in.sin_addr = dst_addr;
@@ -188,7 +141,7 @@ namespace {
                 uint32_t rseq = ntohl(tcph->ack_seq);
                 uint32_t rack_seq = ntohl(tcph->seq) + 1;
 
-                send_rst_packet(sock, src_ip, dst_ip, src_port, dst_port, id, rseq, rack_seq);
+                send_tcp_packet(sock, src_ip, dst_ip, src_port, dst_port, id, rseq, rack_seq, false, true, true);
                 return true;
             }
 
@@ -200,6 +153,7 @@ namespace {
 }
 
 std::vector<int> syn_scan(const char* src_ip, const char* dst_ip, int port_begin, int port_end, int timeout_ms) {
+    // using raw socket.
     Socket sock { AF_INET, SOCK_RAW, IPPROTO_TCP };
 
     struct timeval tv;
@@ -217,22 +171,29 @@ std::vector<int> syn_scan(const char* src_ip, const char* dst_ip, int port_begin
         throw std::system_error{ ec, "sys call setsockopt() failed on IP_HDRINCL" };
     }
 
+    // to generate random id and  source port. 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dist(0, 65535);
 
+    // here we just create a port lists, except for the port begin to the port end, it can add some common ports, like 443, 3306, 8000.
+    std::vector<int> port_lists;
+    for (int i = std::min(port_begin, port_end); i <= std::max(port_begin, port_end); ++i) {
+        port_lists.emplace_back(i);
+    }
+
     std::vector<int> opened_ports;
 
-    for (int i = port_begin; i <= port_end; ++i) {
+    for (int dst_port : port_lists) {
         int id = dist(gen);
         int src_port = 30000 + dist(gen) % 30000;   // every scan just uses a random port.
-
-        if (!send_syn_packet(sock.handle(), src_ip, dst_ip, src_port, i, id)) {
+        
+        if (!send_tcp_packet(sock.handle(), src_ip, dst_ip, src_port, dst_port, id, id, 0, true, false, false)) {
             continue;
         }
 
-        if (recv_response(sock.handle(), src_ip, dst_ip, src_port, i, id)) {
-            opened_ports.emplace_back(i);
+        if (recv_response(sock.handle(), src_ip, dst_ip, src_port, dst_port, id)) {
+            opened_ports.emplace_back(dst_port);
         }
     }
 
