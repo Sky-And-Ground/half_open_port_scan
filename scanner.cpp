@@ -108,7 +108,7 @@ namespace {
         return sendto(sock, packet, sizeof(struct iphdr) + sizeof(struct tcphdr), 0, (struct sockaddr*)&dst_in, sizeof(dst_in)) >= 0;
     }
 
-    void recv_response(int sock, const char* src_ip, const char* dst_ip, std::vector<int>& opened_ports, std::unordered_set<int> sent_ports) {
+    void recv_response(int sock, const char* src_ip, const char* dst_ip, std::vector<int>& opened_ports, std::unordered_set<int>& sent_ports) {
         char buffer[4096];
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
